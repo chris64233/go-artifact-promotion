@@ -187,6 +187,9 @@ func (s *Service) IssueAttestation(req IssueAttestationRequest) (Attestation, er
 
 // RevokeAttestation 撤销证明。已撤销的证明不再能支撑任何新的晋级，
 // 但已完成晋级保存的证明快照不受影响。重复撤销返回 ErrInvalidArgument。
+//
+// 撤销会推进全局证明修订号：冻结了旧修订号的未执行回滚计划将在执行时
+// 被判为冲突（见 Service.ExecuteRollback）。
 func (s *Service) RevokeAttestation(id, reason string) error {
 	if id == "" {
 		return invalidArgument("attestation id is required")
@@ -202,6 +205,7 @@ func (s *Service) RevokeAttestation(id, reason string) error {
 		a.RevokedAt = s.clock.Now().UTC()
 		a.RevokeReason = reason
 		tx.putAttestation(a)
+		tx.bumpAttestationRevision()
 		return nil
 	})
 }
@@ -264,6 +268,7 @@ func (s *Service) ConfigurePolicy(p Policy) (Policy, error) {
 			Environment:          p.Environment,
 			RequiredAttestations: requirements,
 			UpstreamEnvironment:  p.UpstreamEnvironment,
+			Version:              tx.bumpPolicyVersion(p.Environment),
 			UpdatedAt:            now,
 		}
 		tx.putPolicy(out)
@@ -319,6 +324,56 @@ func failurePriority(err error) int {
 	}
 }
 
+// checkPolicyAttestations 在事务快照的 now 时刻，校验 digest 对策略要求的
+// 每种证明类型都至少有一份当前有效材料，返回按要求顺序选出的证明快照。
+// 普通晋级与普通回滚执行共用这套判定。
+func checkPolicyAttestations(tx kvTx, policy Policy, digest Digest, now time.Time) ([]AttestationSnapshot, error) {
+	available := tx.listAttestations(digest)
+	chosen := make([]AttestationSnapshot, 0, len(policy.RequiredAttestations))
+	for _, required := range policy.RequiredAttestations {
+		var candidates []Attestation
+		for _, a := range available {
+			if a.Type == required {
+				candidates = append(candidates, a)
+			}
+		}
+		if len(candidates) == 0 {
+			return nil, fmt.Errorf("%w: type %q for artifact %s",
+				ErrMissingAttestation, required, digest)
+		}
+		var picked *Attestation
+		var bestFailure error
+		for i := range candidates {
+			if fErr := validityFailure(candidates[i], now); fErr == nil {
+				picked = &candidates[i]
+				break
+			} else if bestFailure == nil ||
+				failurePriority(fErr) > failurePriority(bestFailure) {
+				bestFailure = fErr
+			}
+		}
+		if picked == nil {
+			return nil, fmt.Errorf("%w: no valid attestation of type %q: %v",
+				bestFailure, required, bestFailure)
+		}
+		chosen = append(chosen, AttestationSnapshot{Attestation: *picked})
+	}
+	return chosen, nil
+}
+
+// checkUpstream 校验策略的上游环境当前正指向 digest。
+func checkUpstream(tx kvTx, policy Policy, digest Digest) error {
+	if policy.UpstreamEnvironment == "" {
+		return nil
+	}
+	upstream := tx.getPointer(policy.UpstreamEnvironment)
+	if upstream.Version == 0 || upstream.Digest != digest {
+		return fmt.Errorf("%w: artifact %s is not the current version of %s",
+			ErrUpstreamNotPromoted, digest, policy.UpstreamEnvironment)
+	}
+	return nil
+}
+
 // Promote 在一致快照上检查全部晋级条件，全部成立后原子切换环境指针，
 // 并把当时的策略与采用的证明快照永久固化到晋级记录中。
 //
@@ -365,44 +420,14 @@ func (s *Service) Promote(req PromotionRequest) (Promotion, error) {
 		now := s.clock.Now().UTC()
 
 		// 一致快照检查：此刻读取该制品全部可用证明，逐类型挑选有效材料。
-		available := tx.listAttestations(req.Digest)
-		chosen := make([]AttestationSnapshot, 0, len(policy.RequiredAttestations))
-		for _, required := range policy.RequiredAttestations {
-			var candidates []Attestation
-			for _, a := range available {
-				if a.Type == required {
-					candidates = append(candidates, a)
-				}
-			}
-			if len(candidates) == 0 {
-				return fmt.Errorf("%w: type %q for artifact %s",
-					ErrMissingAttestation, required, req.Digest)
-			}
-			var picked *Attestation
-			var bestFailure error
-			for i := range candidates {
-				if fErr := validityFailure(candidates[i], now); fErr == nil {
-					picked = &candidates[i]
-					break
-				} else if bestFailure == nil ||
-					failurePriority(fErr) > failurePriority(bestFailure) {
-					bestFailure = fErr
-				}
-			}
-			if picked == nil {
-				return fmt.Errorf("%w: no valid attestation of type %q: %v",
-					bestFailure, required, bestFailure)
-			}
-			chosen = append(chosen, AttestationSnapshot{Attestation: *picked})
+		chosen, err := checkPolicyAttestations(tx, policy, req.Digest, now)
+		if err != nil {
+			return err
 		}
 
 		// 上游晋级要求：上游环境当前必须正指向同一制品。
-		if policy.UpstreamEnvironment != "" {
-			upstream := tx.getPointer(policy.UpstreamEnvironment)
-			if upstream.Version == 0 || upstream.Digest != req.Digest {
-				return fmt.Errorf("%w: artifact %s is not the current version of %s",
-					ErrUpstreamNotPromoted, req.Digest, policy.UpstreamEnvironment)
-			}
+		if err := checkUpstream(tx, policy, req.Digest); err != nil {
+			return err
 		}
 
 		// 全部条件成立：记录与指针在同一事务内原子提交。
