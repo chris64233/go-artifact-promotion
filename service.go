@@ -202,6 +202,8 @@ func (s *Service) RevokeAttestation(id, reason string) error {
 		a.RevokedAt = s.clock.Now().UTC()
 		a.RevokeReason = reason
 		tx.putAttestation(a)
+		// 撤销推进全局证明修订号：已创建未执行的回滚计划会因此冲突。
+		tx.s.AttestationRevision++
 		return nil
 	})
 }
@@ -319,6 +321,54 @@ func failurePriority(err error) int {
 	}
 }
 
+// selectAttestations 在一致快照上为策略要求的每种证明类型挑选一份当前有效
+// 的材料；任一类型无有效材料时返回可区分的失败原因。
+func selectAttestations(tx kvTx, policy Policy, digest Digest, now time.Time) ([]AttestationSnapshot, error) {
+	available := tx.listAttestations(digest)
+	chosen := make([]AttestationSnapshot, 0, len(policy.RequiredAttestations))
+	for _, required := range policy.RequiredAttestations {
+		var candidates []Attestation
+		for _, a := range available {
+			if a.Type == required {
+				candidates = append(candidates, a)
+			}
+		}
+		if len(candidates) == 0 {
+			return nil, fmt.Errorf("%w: type %q for artifact %s",
+				ErrMissingAttestation, required, digest)
+		}
+		var picked *Attestation
+		var bestFailure error
+		for i := range candidates {
+			if fErr := validityFailure(candidates[i], now); fErr == nil {
+				picked = &candidates[i]
+				break
+			} else if bestFailure == nil ||
+				failurePriority(fErr) > failurePriority(bestFailure) {
+				bestFailure = fErr
+			}
+		}
+		if picked == nil {
+			return nil, fmt.Errorf("%w: no valid attestation of type %q: %v",
+				bestFailure, required, bestFailure)
+		}
+		chosen = append(chosen, AttestationSnapshot{Attestation: *picked})
+	}
+	return chosen, nil
+}
+
+// checkUpstream 校验策略要求的上游环境当前正指向同一制品。
+func checkUpstream(tx kvTx, policy Policy, digest Digest) error {
+	if policy.UpstreamEnvironment != "" {
+		upstream := tx.getPointer(policy.UpstreamEnvironment)
+		if upstream.Version == 0 || upstream.Digest != digest {
+			return fmt.Errorf("%w: artifact %s is not the current version of %s",
+				ErrUpstreamNotPromoted, digest, policy.UpstreamEnvironment)
+		}
+	}
+	return nil
+}
+
 // Promote 在一致快照上检查全部晋级条件，全部成立后原子切换环境指针，
 // 并把当时的策略与采用的证明快照永久固化到晋级记录中。
 //
@@ -365,44 +415,14 @@ func (s *Service) Promote(req PromotionRequest) (Promotion, error) {
 		now := s.clock.Now().UTC()
 
 		// 一致快照检查：此刻读取该制品全部可用证明，逐类型挑选有效材料。
-		available := tx.listAttestations(req.Digest)
-		chosen := make([]AttestationSnapshot, 0, len(policy.RequiredAttestations))
-		for _, required := range policy.RequiredAttestations {
-			var candidates []Attestation
-			for _, a := range available {
-				if a.Type == required {
-					candidates = append(candidates, a)
-				}
-			}
-			if len(candidates) == 0 {
-				return fmt.Errorf("%w: type %q for artifact %s",
-					ErrMissingAttestation, required, req.Digest)
-			}
-			var picked *Attestation
-			var bestFailure error
-			for i := range candidates {
-				if fErr := validityFailure(candidates[i], now); fErr == nil {
-					picked = &candidates[i]
-					break
-				} else if bestFailure == nil ||
-					failurePriority(fErr) > failurePriority(bestFailure) {
-					bestFailure = fErr
-				}
-			}
-			if picked == nil {
-				return fmt.Errorf("%w: no valid attestation of type %q: %v",
-					bestFailure, required, bestFailure)
-			}
-			chosen = append(chosen, AttestationSnapshot{Attestation: *picked})
+		chosen, err := selectAttestations(tx, policy, req.Digest, now)
+		if err != nil {
+			return err
 		}
 
 		// 上游晋级要求：上游环境当前必须正指向同一制品。
-		if policy.UpstreamEnvironment != "" {
-			upstream := tx.getPointer(policy.UpstreamEnvironment)
-			if upstream.Version == 0 || upstream.Digest != req.Digest {
-				return fmt.Errorf("%w: artifact %s is not the current version of %s",
-					ErrUpstreamNotPromoted, req.Digest, policy.UpstreamEnvironment)
-			}
+		if err := checkUpstream(tx, policy, req.Digest); err != nil {
+			return err
 		}
 
 		// 全部条件成立：记录与指针在同一事务内原子提交。

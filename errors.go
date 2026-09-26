@@ -34,6 +34,12 @@ var (
 	ErrUpstreamNotPromoted = errors.New("artifact not promoted in upstream environment")
 	// ErrPromotionNotFound 晋级记录不存在。
 	ErrPromotionNotFound = errors.New("promotion not found")
+	// ErrRollbackNotFound 回滚计划不存在。
+	ErrRollbackNotFound = errors.New("rollback not found")
+	// ErrRollbackNotApproved 紧急回滚尚未取得两个不同授权人的批准。
+	ErrRollbackNotApproved = errors.New("rollback not approved")
+	// ErrRollbackTargetInvalid 回滚目标不是该环境历史上成功晋级且未被安全撤销的版本。
+	ErrRollbackTargetInvalid = errors.New("rollback target invalid")
 )
 
 func invalidArgument(format string, args ...any) error {

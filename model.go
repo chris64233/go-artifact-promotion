@@ -79,7 +79,14 @@ type Promotion struct {
 	Attestations   []AttestationSnapshot
 	PolicySnapshot Policy
 	PromotedAt     time.Time
+	// SafetyRevokedAt 非零表示该晋级版本已被安全撤销（判定为不安全），
+	// 此后不得再作为回滚目标。撤销只打标记，不删除历史。
+	SafetyRevokedAt    time.Time
+	SafetyRevokeReason string
 }
+
+// SafetyRevoked 报告该晋级版本是否已被安全撤销。
+func (p Promotion) SafetyRevoked() bool { return !p.SafetyRevokedAt.IsZero() }
 
 // EnvironmentPointer 是某一部署环境当前指向的已晋级版本。
 // 任意时刻一个环境最多只指向一个制品。

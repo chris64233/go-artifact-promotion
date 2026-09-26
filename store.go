@@ -93,6 +93,52 @@ func (t kvTx) listPromotions(env Environment) []Promotion {
 	return out
 }
 
+func (t kvTx) rollbackByNumber(number string) (RollbackPlan, bool) {
+	id, ok := t.s.RollbackIndex[number]
+	if !ok {
+		return RollbackPlan{}, false
+	}
+	return *t.s.Rollbacks[id-1], true
+}
+
+// addRollback 分配单调 ID 并写入回滚计划，返回新计划。
+func (t kvTx) addRollback(p RollbackPlan) RollbackPlan {
+	p.ID = t.s.NextRollbackID
+	t.s.NextRollbackID++
+	t.s.Rollbacks = append(t.s.Rollbacks, &p)
+	t.s.RollbackIndex[p.RollbackNumber] = p.ID
+	return p
+}
+
+// putRollback 按 ID 覆盖已有回滚计划（用于审批与执行状态推进）。
+func (t kvTx) putRollback(p RollbackPlan) { t.s.Rollbacks[p.ID-1] = &p }
+
+func (t kvTx) listRollbacks(env Environment) []RollbackPlan {
+	var out []RollbackPlan
+	for _, p := range t.s.Rollbacks {
+		if env == "" || p.Environment == env {
+			out = append(out, *p)
+		}
+	}
+	return out
+}
+
+// addOutbox 追加一条通知 outbox 消息，返回带 ID 的消息。
+func (t kvTx) addOutbox(m OutboxMessage) OutboxMessage {
+	m.ID = t.s.NextOutboxID
+	t.s.NextOutboxID++
+	t.s.Outbox = append(t.s.Outbox, &m)
+	return m
+}
+
+// addAudit 追加一条审计事件，返回带 ID 的事件。
+func (t kvTx) addAudit(e AuditEvent) AuditEvent {
+	e.ID = t.s.NextAuditID
+	t.s.NextAuditID++
+	t.s.AuditEvents = append(t.s.AuditEvents, &e)
+	return e
+}
+
 // state 是服务的完整持久化状态。
 type state struct {
 	Artifacts    map[string]*Artifact           `json:"artifacts"`
@@ -101,33 +147,55 @@ type state struct {
 	Pointers     map[string]*EnvironmentPointer `json:"pointers"`
 	Promotions   []*Promotion                   `json:"promotions"`
 	ChangeIndex  map[string]int64               `json:"change_index"`
-	NextID       int64                          `json:"next_id"`
-	NextAttID    int64                          `json:"next_attestation_id"`
+	// AttestationRevision 在每次证明撤销时递增；回滚计划在创建时冻结该值，
+	// 执行时若不匹配则说明有撤销先落地，必须冲突。
+	AttestationRevision int64            `json:"attestation_revision"`
+	Rollbacks           []*RollbackPlan  `json:"rollbacks"`
+	RollbackIndex       map[string]int64 `json:"rollback_index"`
+	Outbox              []*OutboxMessage `json:"outbox"`
+	AuditEvents         []*AuditEvent    `json:"audit_events"`
+	NextID              int64            `json:"next_id"`
+	NextAttID           int64            `json:"next_attestation_id"`
+	NextRollbackID      int64            `json:"next_rollback_id"`
+	NextOutboxID        int64            `json:"next_outbox_id"`
+	NextAuditID         int64            `json:"next_audit_id"`
 }
 
 func newState() *state {
 	return &state{
-		Artifacts:    map[string]*Artifact{},
-		Attestations: map[string]*Attestation{},
-		Policies:     map[string]*Policy{},
-		Pointers:     map[string]*EnvironmentPointer{},
-		ChangeIndex:  map[string]int64{},
-		NextID:       1,
-		NextAttID:    1,
+		Artifacts:      map[string]*Artifact{},
+		Attestations:   map[string]*Attestation{},
+		Policies:       map[string]*Policy{},
+		Pointers:       map[string]*EnvironmentPointer{},
+		ChangeIndex:    map[string]int64{},
+		RollbackIndex:  map[string]int64{},
+		NextID:         1,
+		NextAttID:      1,
+		NextRollbackID: 1,
+		NextOutboxID:   1,
+		NextAuditID:    1,
 	}
 }
 
 // clone 生成深拷贝，事务在副本上修改，失败回滚不影响已提交状态。
 func (s *state) clone() *state {
 	c := &state{
-		Artifacts:    make(map[string]*Artifact, len(s.Artifacts)),
-		Attestations: make(map[string]*Attestation, len(s.Attestations)),
-		Policies:     make(map[string]*Policy, len(s.Policies)),
-		Pointers:     make(map[string]*EnvironmentPointer, len(s.Pointers)),
-		Promotions:   make([]*Promotion, 0, len(s.Promotions)),
-		ChangeIndex:  make(map[string]int64, len(s.ChangeIndex)),
-		NextID:       s.NextID,
-		NextAttID:    s.NextAttID,
+		Artifacts:           make(map[string]*Artifact, len(s.Artifacts)),
+		Attestations:        make(map[string]*Attestation, len(s.Attestations)),
+		Policies:            make(map[string]*Policy, len(s.Policies)),
+		Pointers:            make(map[string]*EnvironmentPointer, len(s.Pointers)),
+		Promotions:          make([]*Promotion, 0, len(s.Promotions)),
+		ChangeIndex:         make(map[string]int64, len(s.ChangeIndex)),
+		AttestationRevision: s.AttestationRevision,
+		Rollbacks:           make([]*RollbackPlan, 0, len(s.Rollbacks)),
+		RollbackIndex:       make(map[string]int64, len(s.RollbackIndex)),
+		Outbox:              make([]*OutboxMessage, 0, len(s.Outbox)),
+		AuditEvents:         make([]*AuditEvent, 0, len(s.AuditEvents)),
+		NextID:              s.NextID,
+		NextAttID:           s.NextAttID,
+		NextRollbackID:      s.NextRollbackID,
+		NextOutboxID:        s.NextOutboxID,
+		NextAuditID:         s.NextAuditID,
 	}
 	for k, v := range s.Artifacts {
 		a := *v
@@ -155,6 +223,24 @@ func (s *state) clone() *state {
 		q.PolicySnapshot.RequiredAttestations =
 			append([]AttestationType(nil), p.PolicySnapshot.RequiredAttestations...)
 		c.Promotions = append(c.Promotions, &q)
+	}
+	for k, v := range s.RollbackIndex {
+		c.RollbackIndex[k] = v
+	}
+	for _, r := range s.Rollbacks {
+		q := *r
+		q.Approvals = append([]Approval(nil), r.Approvals...)
+		q.PolicySnapshot.RequiredAttestations =
+			append([]AttestationType(nil), r.PolicySnapshot.RequiredAttestations...)
+		c.Rollbacks = append(c.Rollbacks, &q)
+	}
+	for _, m := range s.Outbox {
+		q := *m
+		c.Outbox = append(c.Outbox, &q)
+	}
+	for _, e := range s.AuditEvents {
+		q := *e
+		c.AuditEvents = append(c.AuditEvents, &q)
 	}
 	return c
 }
@@ -190,6 +276,19 @@ func newFileStore(path string) (*memStore, error) {
 	}
 	if m.root.Artifacts == nil {
 		m.root = newState()
+	}
+	// 兼容旧版本状态文件：补齐后引入的字段。
+	if m.root.RollbackIndex == nil {
+		m.root.RollbackIndex = map[string]int64{}
+	}
+	if m.root.NextRollbackID == 0 {
+		m.root.NextRollbackID = 1
+	}
+	if m.root.NextOutboxID == 0 {
+		m.root.NextOutboxID = 1
+	}
+	if m.root.NextAuditID == 0 {
+		m.root.NextAuditID = 1
 	}
 	return m, nil
 }
