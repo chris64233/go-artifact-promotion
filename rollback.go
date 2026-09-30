@@ -462,6 +462,23 @@ func (s *Service) Timeline(env Environment) ([]TimelineEntry, error) {
 				OccurredAt:        r.ExecutedAt,
 			})
 		}
+		for _, sp := range tx.listStagedRollbacks() {
+			for _, se := range sp.Entries {
+				if se.Environment != env || se.Status != StagedEntrySucceeded {
+					continue
+				}
+				out = append(out, TimelineEntry{
+					Environment:       env,
+					Version:           se.ResultVersion,
+					Kind:              "staged_rollback",
+					Digest:            se.TargetDigest,
+					StagedNumber:      sp.Number,
+					TargetPromotionID: se.TargetPromotionID,
+					Emergency:         sp.Kind == RollbackEmergency,
+					OccurredAt:        se.ExecutedAt,
+				})
+			}
+		}
 		return nil
 	})
 	if err != nil {
@@ -606,7 +623,12 @@ func (s *Service) AuditLog(env Environment, highOnly bool) ([]AuditEvent, error)
 func (s *Service) PendingOutbox() ([]OutboxMessage, error) {
 	var out []OutboxMessage
 	err := s.store.view(func(tx kvTx) error {
-		out = tx.listOutbox(false)
+		for _, m := range tx.listOutbox(false) {
+			// 分批回滚的逐环境通知由 PendingStagedOutbox 单独拉取。
+			if m.StagedNumber == "" {
+				out = append(out, m)
+			}
+		}
 		return nil
 	})
 	if err != nil {
