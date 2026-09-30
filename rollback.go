@@ -427,8 +427,8 @@ func (s *Service) GetRollback(number string) (RollbackPlan, error) {
 	return out, err
 }
 
-// Timeline 返回某环境的完整版本时间线：全部成功晋级与已执行回滚按环境版本
-// 号排序合并。回滚之后的晋级历史仍然保留在时间线上。
+// Timeline 返回某环境的完整版本时间线：全部成功晋级、已执行的单笔回滚与
+// 分批回滚落地节点按环境版本号排序合并。回滚之后的晋级历史仍然保留。
 func (s *Service) Timeline(env Environment) ([]TimelineEntry, error) {
 	if env == "" {
 		return nil, invalidArgument("environment is required")
@@ -461,6 +461,23 @@ func (s *Service) Timeline(env Environment) ([]TimelineEntry, error) {
 				Emergency:         r.Kind == RollbackEmergency,
 				OccurredAt:        r.ExecutedAt,
 			})
+		}
+		for _, sp := range tx.listStagedRollbacks() {
+			for _, e := range sp.Entries {
+				if e.Environment != env || e.Status != StagedEntrySucceeded {
+					continue
+				}
+				out = append(out, TimelineEntry{
+					Environment:       env,
+					Version:           e.ResultVersion,
+					Kind:              "staged_rollback",
+					Digest:            e.TargetDigest,
+					StagedNumber:      sp.Number,
+					TargetPromotionID: e.TargetPromotionID,
+					Emergency:         sp.Kind == RollbackEmergency,
+					OccurredAt:        e.ExecutedAt,
+				})
+			}
 		}
 		return nil
 	})
@@ -606,7 +623,12 @@ func (s *Service) AuditLog(env Environment, highOnly bool) ([]AuditEvent, error)
 func (s *Service) PendingOutbox() ([]OutboxMessage, error) {
 	var out []OutboxMessage
 	err := s.store.view(func(tx kvTx) error {
-		out = tx.listOutbox(false)
+		for _, m := range tx.listOutbox(false) {
+			// 分批回滚的逐环境通知由 PendingStagedOutbox 单独拉取。
+			if m.StagedNumber == "" {
+				out = append(out, m)
+			}
+		}
 		return nil
 	})
 	if err != nil {

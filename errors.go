@@ -43,6 +43,11 @@ var (
 	ErrRollbackNotApproved = errors.New("rollback not approved")
 	// ErrRollbackState 计划当前状态不允许该操作（例如已执行/已冲突后再批准）。
 	ErrRollbackState = errors.New("rollback state invalid")
+	// ErrStagedRollbackNotFound 跨环境分批回滚计划不存在。
+	ErrStagedRollbackNotFound = errors.New("staged rollback not found")
+	// ErrStagedRollbackState 分批回滚计划当前状态不允许该操作
+	// （例如已取消/已冲突后再恢复或批准）。
+	ErrStagedRollbackState = errors.New("staged rollback state invalid")
 )
 
 func invalidArgument(format string, args ...any) error {

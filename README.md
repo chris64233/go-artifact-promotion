@@ -4,7 +4,8 @@
 （必备的有效证明类型、上游环境已放行）时，才能把环境指针原子切换到该版本。
 在晋级之上还提供**紧急回滚**（创建冻结、普通/紧急双通道、双人批准、条件
 执行、一次性通知 outbox、审计）、**历史版本安全撤销**与**受影响下游环境
-追踪**。全部状态可持久化到本地 JSON 文件，重启后完整恢复。
+追踪**，以及**跨环境分批回滚计划**（一个目标制品、多个环境、按批次推进、
+失败暂停/恢复/取消）。全部状态可持久化到本地 JSON 文件，重启后完整恢复。
 
 开发环境：Go 1.23.0。
 
@@ -20,6 +21,8 @@
 | `Promotion` | 一次成功晋级的永久记录，固化当时的**策略快照**与**证明快照**；可被安全撤销（打标记，不删除） |
 | `RollbackPlan` | 一笔回滚计划：创建时冻结**目标版本、当前环境版本、策略版本（策略快照）、证明修订号、发起原因** |
 | `RollbackApproval` | 授权人对紧急回滚的批准证据（批准人、意见、时间） |
+| `StagedRollbackPlan` | 跨环境分批回滚计划：创建时冻结**目标制品、环境（批次）顺序、各环境目标版本、各环境当前版本与策略快照、证明修订号**；每个环境条目带独立的状态、结果版本与阻断原因 |
+| `StagedBatchReport` | 单批执行报告：批内每个环境采用的版本、结果状态（pending/succeeded/blocked/conflicted/skipped）与阻断原因 |
 | `AuditEvent` | 不可变审计事件；紧急回滚全过程与安全撤销产生**高优先级**事件 |
 | `OutboxMessage` | 回滚执行后在同一事务内写入的一次性通知（事务型 outbox） |
 
@@ -129,6 +132,66 @@
   晋级。
 - `AuditLog(env, highOnly)`：审计事件查询，可只看高优先级。
 
+### 8. 跨环境分批回滚（暂停 / 恢复 / 取消）
+
+`CreateStagedRollback` 发起一笔覆盖多个环境的回滚计划：**统一目标制品**、
+**按批次排列的环境顺序**、批内按给出的顺序执行。一笔计划在同一串行事务
+模型内推进，任何时刻都能说明“每个环境最终采用了哪个版本”。
+
+**创建时冻结**（任何一个环境不满足都整笔拒绝创建）：
+
+- 目标制品必须在每个目标环境都**历史上成功晋级过、未被安全撤销、且不是
+  当前指针**（`ErrRollbackTargetInvalid`）；制品未登记返回
+  `ErrArtifactNotFound`，环境策略未配置返回 `ErrPolicyNotFound`；
+- 每个环境冻结：目标版本（最近一次对应成功晋级记录 ID 与当时环境版本）、
+  **当前环境版本**（版本号+摘要+来源记录）、**策略版本与完整策略快照**、
+  全局**证明修订号**；计划还冻结统一原因；
+- 至少一批、每批至少一个环境、同一环境不得在计划中重复；同一环境不能同时
+  被两笔未终结（pending/paused）的分批计划覆盖（`ErrStagedRollbackState`），
+  计划终结（completed/conflicted/canceled）后该环境才可重新加入；
+- 外部分批回滚号幂等：同号 + 同类型/同目标/同批次顺序的重放返回已有计划；
+  任一字段不同返回 `ErrChangeConflict`。紧急计划创建即写高优先级审计。
+
+**执行 `ExecuteStagedRollback`** 在一个事务快照内分两阶段：
+
+1. **版本冲突预检（针对所有尚未成功的环境）**：
+   - 目标晋级记录被安全撤销 → `ErrRollbackTargetInvalid`；
+   - 环境指针偏离冻结的版本/摘要/来源记录 → `ErrConcurrentModification`；
+   - 全局证明修订号在创建后推进（期间有任何证明撤销）→
+     `ErrConcurrentModification`。
+
+   任一命中，计划**立即终结为 `conflicted`**，预检阶段不切换任何指针、不写
+   outbox，所有已成功环境保持原状，冲突原因代码（`target_safety_revoked` /
+   `environment_version_conflict` / `attestation_revision_conflict`）固化在
+   首个冲突环境与计划级，重放永远返回同一冲突、不可复活。
+2. **按批次顺序推进**：紧急计划先校验两个不同授权人批准；逐环境做门槛检查
+   （普通计划满足**执行时刻当前策略**：证明有效 + 上游指针；紧急计划绕过
+   证明但按**冻结策略快照**保留上游不变量）。**一批全部成功后才进入下一批**；
+   每个环境成功都原子切换指针（版本号继续单调递增）、固化 `ResultVersion`，
+   并在同一事务写一条 outbox 通知（`PendingStagedOutbox`）与审计事件。
+
+**暂停（paused）、恢复（resume）、取消（canceled）三者的区别**：
+
+| | 触发 | 对已成功环境 | 对阻断/未开始环境 | 后续 |
+| --- | --- | --- | --- | --- |
+| **暂停 paused** | 批次中某个环境门槛失败（缺批准、证明过期/缺类、上游未指向目标、策略缺失） | **保持现状、结果版本固化**，绝不回滚 | 阻断环境记 `blocked`+原因代码；其后环境仍 `pending` | 用**同一计划号再次调用** `ExecuteStagedRollback` 即**恢复：从失败环境继续**，已成功环境不重试、不重复发通知；阻断修复前重放仍返回原门槛错误并累加尝试计数 |
+| **版本冲突 conflicted** | 尚未成功的环境指针漂移、目标被安全撤销、证明修订号推进 | 保持现状 | 首个冲突环境记 `conflicted`，计划终结 | **不可恢复**，只能基于新状态新建计划；重放返回同一冲突 |
+| **取消 canceled** | 人工 `CancelStagedRollback`（需操作人+原因） | **绝不回滚，也不能被重新加入同一计划** | `pending`/`blocked` 环境转为 `skipped`，后续批次不再执行 | 终结状态：重复取消幂等返回；再执行/批准返回 `ErrStagedRollbackState`；已完成或已冲突的计划不能取消 |
+
+注意暂停期间的版本漂移同样致命：恢复时预检会发现被阻断或未开始环境的指针
+已偏离冻结值（或目标被撤销、证明被撤销），计划从 paused **终结为
+conflicted**——这正是“尚未开始的环境版本变化时旧计划拒绝执行”的语义。
+
+紧急分批计划通过 `ApproveStagedRollback` 取得两个**不同授权人**批准
+（同一人重复批准被拒；普通计划不接受批准；仅 pending/paused 可批准）。
+
+**查询**：`GetStagedRollback(number)` 返回计划（含审批证据）；
+`plan.BatchReports()` 按批次给出每批汇总状态（pending / in_progress /
+succeeded / blocked / conflicted / canceled / partially_canceled）与批内每个
+环境的**采用版本、结果状态、阻断原因代码**；`plan.EntryByEnv(env)` 取单环境
+结果；`StagedOutboxForPlan(number)` 取该计划已生成的全部逐环境通知。分批
+回滚落地节点同样出现在各环境的 `Timeline` 中（kind 为 `staged_rollback`）。
+
 ## API 速览
 
 ```go
@@ -181,6 +244,38 @@ svc.ApproveRollback(plan.Number, "bob", "approved rollback")
 // 执行：冻结的环境版本/证明修订已变化时返回 ErrConcurrentModification
 done, err := svc.ExecuteRollback(plan.Number)
 
+// 跨环境分批回滚：一个目标制品，按批次覆盖多个环境
+staged, err := svc.CreateStagedRollback(CreateStagedRollbackRequest{
+    Number:       "SR-2026-0002",
+    Kind:         artifactpromotion.RollbackNormal, // 或 RollbackEmergency
+    TargetDigest: olderDigest,
+    Batches: []StagedBatchRequest{
+        {Environments: []Environment{"dev"}},               // 第 1 批
+        {Environments: []Environment{"staging"}},           // 第 1 批全成功后才执行
+        {Environments: []Environment{"prod-canary", "prod"}},
+    },
+    Reason:      "SEV-2: 分环境逐步回退有缺陷的版本",
+    RequestedBy: "oncall",
+})
+
+// 推进/恢复：门槛失败返回错误且计划 paused；修复后用同一计划号再次调用，
+// 从失败批次继续。已完成计划的重放幂等返回首次结果。
+staged, err = svc.ExecuteStagedRollback(staged.Number)
+
+// 紧急分批计划：两个不同授权人（pending/paused 期间都可批准）
+svc.ApproveStagedRollback(staged.Number, "alice", "confirmed")
+svc.ApproveStagedRollback(staged.Number, "bob", "approved")
+
+// 取消：只跳过未开始/被阻断的环境，已成功环境不回滚
+svc.CancelStagedRollback(staged.Number, "oncall", "mitigated by forward fix")
+
+// 查询每批采用的版本、结果与阻断原因
+got, _ := svc.GetStagedRollback(staged.Number)
+for _, r := range got.BatchReports() { // r.Status + 每个 r.Entries[i].ResultVersion/Status/BlockCode
+}
+stagedMsgs, _ := svc.PendingStagedOutbox()          // 分批回滚的逐环境通知
+msgs, _       := svc.StagedOutboxForPlan(staged.Number)
+
 // 安全撤销某个历史晋级版本（高优先级审计）
 svc.RevokePromotionSafety(rec.ID, "security", "signing key compromised")
 
@@ -188,7 +283,7 @@ svc.RevokePromotionSafety(rec.ID, "security", "signing key compromised")
 ptr, _   := svc.GetPointer("prod")          // 环境当前指向
 hist, _  := svc.History("prod")             // 晋级历史（传 "" 为全部环境，按时间排序）
 tl, _    := svc.Timeline("prod")            // 晋级 + 已执行回滚的版本时间线
-rb, _    := svc.GetRollback(plan.Number)    // 计划含审批证据
+rb, _    := svc.GetRollback(plan.Number)    // 单笔计划含审批证据
 aff, _   := svc.AffectedDownstreams("prod") // 指针不一致的直接/间接下游
 audit, _ := svc.AuditLog("prod", true)      // 仅高优先级审计事件
 pending, _ := svc.PendingOutbox()           // 未投递的一次性通知
@@ -219,16 +314,25 @@ pending, _ := svc.PendingOutbox()           // 未投递的一次性通知
 | `ErrRollbackTargetInvalid` | 目标从未成功晋级到该环境、已是当前版本，或已被安全撤销（创建/执行时） |
 | `ErrRollbackNotApproved` | 紧急回滚未取得两个不同授权人批准 |
 | `ErrRollbackState` | 对普通回滚追加批准，或计划已终结（已执行/已冲突）后再批准 |
+| `ErrStagedRollbackNotFound` | 分批回滚计划不存在 |
+| `ErrStagedRollbackState` | 分批计划状态不允许该操作（活动计划覆盖同一环境、对已取消/已冲突计划执行或批准、取消已完成/已冲突计划等） |
 
 失败的晋级不移动指针、不写历史、不消耗变更号（修正条件后可用原变更号重试）。
+
+分批回滚的门槛失败不使用独立错误哨兵：执行直接返回底层门槛错误
+（`ErrRollbackNotApproved` / `ErrMissingAttestation` /
+`ErrAttestationRevoked` / `ErrAttestationExpired` /
+`ErrUpstreamNotPromoted` / `ErrPolicyNotFound`），同时计划转为 `paused`，
+原因代码固化在 `BlockCode` 上；版本冲突类错误终结计划为 `conflicted`。
 
 ## 持久化
 
 `NewPersistentService(path)` 把全部状态（制品、证明、证明修订号、策略与策略
-修订号、指针、晋级历史、回滚计划（含审批证据）、回滚号索引、审计事件、
-outbox、各 ID 计数器）存为单个 JSON 文件。每次成功提交先写临时文件再
-原子 `rename`，进程崩溃不会留下半截状态；重新打开后幂等语义、审批证据、
-outbox 一次性保证与各版本号/修订号均延续。
+修订号、指针、晋级历史、单笔回滚计划、跨环境分批回滚计划（批次、逐环境冻结
+与结果、审批证据）、回滚号索引、审计事件、outbox、各 ID 计数器）存为单个
+JSON 文件。每次成功提交先写临时文件再原子 `rename`，进程崩溃不会留下半截
+状态；重新打开后幂等语义、暂停/取消状态、审批证据、outbox 一次性保证与各
+版本号/修订号均延续。旧版本写出的状态文件可直接打开，新增字段自动补默认值。
 
 ## 测试
 
@@ -255,3 +359,25 @@ go test -cover ./...         # 覆盖率
 - **并发与持久化**：回滚 vs 晋级 100 轮竞态（恰好一个赢家，输家 plan 终结
   且无 outbox）、紧急回滚全流程落盘-重启恢复（计划/批准/outbox/审计/时间线
   全部延续，重启后执行仍幂等）。
+
+分批回滚相关的测试覆盖（`staged_test.go`）：
+
+- **创建**：冻结目标/各环境当前版本/策略快照/证明修订号/批次顺序；参数校验
+  （空批次/空环境/环境重复/目标从未晋级/目标即当前版本）；活动计划环境重叠
+  拒绝；同号幂等与同号不同批次/类型冲突；
+- **全成功**：多批次与批内多环境顺序执行、每环境版本递增、批次报告、
+  逐环境 outbox 与单笔 outbox 队列隔离、时间线 `staged_rollback` 节点、
+  普通优先级审计；完成后重放幂等（之后环境再被晋级也不回拉、不重发通知）；
+- **暂停/恢复**：上游未对齐与策略加严把计划暂停在失败环境（已完成批次保持
+  现状）、阻断条目带原因代码与尝试计数、补齐条件后同号恢复从失败批次继续、
+  已成功环境不重试不重发通知、批内顺序对上游不变量的影响；
+- **版本冲突**：执行前/暂停期间未开始环境被外部晋级抢占、证明撤销推进修订
+  号、目标晋级被安全撤销——计划终结 conflicted、所有指针不动、无 outbox、
+  重放返回同一冲突（粘性），终结后环境可重新加入新计划；
+- **取消**：开始前取消（全部 skipped、零通知、幂等取消）、暂停后取消
+  （已成功环境保持落地、其余 skipped、部分成功批次报告 partially_canceled）、
+  已完成/已冲突计划不可取消、被跳过环境可另起计划；
+- **紧急分批**：零/单人批准暂停、同人重复批准被拒、双人放行、过期证明与
+  加严策略绕过、冻结策略快照的上游不变量保留、6 条高优先级审计、通知载荷
+  带批准人与紧急标记；
+- **持久化**：紧急计划全流程落盘重启、普通计划暂停状态跨重启后继续推进。
